@@ -9,8 +9,15 @@ A desktop GUI for your Simple Packet Terminal:
 - Arrow-key history, local echo toggle, CR/LF toggle, debug toggle
 - Clean, modern layout using ttkbootstrap
 
-Author: Chengmania (KC3SMW) + ChatGPT
+Author: Chengmania (KC3SMW)
 """
+
+# Ensure PyInstaller bundles Pillow’s Tk pieces
+try:
+    from PIL import ImageTk  # noqa: F401
+except Exception:
+    ImageTk = None
+
 
 import os, sys, socket, threading, time, datetime, re, queue
 import tkinter as tk
