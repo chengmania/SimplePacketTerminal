@@ -63,7 +63,7 @@ Ready to accept KISS TCP client application 0 on port 8001 ...
 
 ## Install
 
-Just copy **SPT.py** into a folder in your `$PATH` (or run it from your project directory).  
+Just copy **SPT.py** into it's own folder and run it.  
 No Python dependencies required.
 
 ---
