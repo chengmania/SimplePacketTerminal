@@ -22,7 +22,6 @@ Created by **Chengmania (KC3SMW)**. Open source and hackable.
 - KISS TCP client for Direwolf
 - AX.25 LAPB (mod-8): SABM/UA/DISC, I-frames, RR (keepalive)
 - Pager awareness for BBS prompts like:  
-  `"<A>bort, <CR> Continue..>"` → **Enter** continues, **A** aborts
 - Colorized prompt: `[MYCALL @ PEER] >>` (TTY only)
 - Logs each session to `session-YYYYMMDD-HHMMSS.log`
 - **UNPROTO (UI) support:**
