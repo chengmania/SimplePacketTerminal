@@ -402,6 +402,25 @@ class KissLink:
             return
 
         base = ctrl & 0xEF  # ignore P/F bit
+        # --- UI frames (UNPROTO) ---
+        if base == CTRL_UI:
+            # Only "monitor" UI when in persistent unproto mode
+            if not getattr(self, "unproto_mode", False):
+                return
+
+            # PID at i+1, info after that
+            if i + 1 >= len(raw):
+                return
+            pid = raw[i+1]
+            info = raw[i+2:]
+
+            # We usually expect PID F0 (text), but still display whatever arrives.
+            text = info.decode("utf-8", errors="replace")
+            text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+            # Show a clean monitor-style line
+            self.on_line(f"[RX UI] {src} > {dest} :: {text}")
+            return
 
         # U-frames
         if base == CTRL_UA:
