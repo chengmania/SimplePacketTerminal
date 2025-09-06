@@ -1,24 +1,8 @@
 #!/usr/bin/env python3
 """
-SPT.py — Simple Packet Terminal (KISS + AX.25)
-
-- Light blue prompt (TTY only).
-- Clears screen on start and again upon successful connect (UA).
-- Pager-friendly: handles "<A>bort, <CR> Continue..>" prompts (Enter continues, 'A' aborts).
-- Helpful commands & aliases:
-    /c or /connect CALL [via DIGI1,DIGI2]
-    /d or /disconnect
-    /q or /quit or /exit
-    /h or /help   (/help -v for verbose)
-    /clear or /cls
-    /status | /echo on|off | /crlf on|off | /debug
-- Unproto:
-    * One-shot:    /unproto DEST [via DIGI1,DIGI2] message...
-    * Persistent:  /unproto DEST [via DIGI1,DIGI2]   (no message -> enters mode)
-                   Exit with /upexit (or /upoff /upstop, or /unproto off|stop|end|exit).
-- Handshake buffer: plain lines typed during AWAIT_UA are queued and sent after UA.
-- Command history & editing (readline): ↑/↓, ←/→, persistent ~/.spt_history (TTY only).
+SPT — Simple Packet Terminal (KISS + AX.25) — minimal, stdlib-only.
 """
+
 import socket, sys, threading, time, datetime
 import re, os, atexit
 
@@ -176,7 +160,7 @@ class KissLink:
         self.appbuf = ""
         self.digis = []
         # QoL
-        self.local_echo = False
+        self.local_echo = True
         self.tx_newline = "\r"
         # Keepalive
         self._ka_alive = False
@@ -484,10 +468,10 @@ BANNER = (
     "Type /help for a quick command list, or /help -v for details.\n"
 )
 
-HELP_BRIEF = ("Commands: /c|/connect CALL [via DIGI1,DIGI2] | "
+HELP_BRIEF = ("\nCommands: /c|/connect CALL [via DIGI1,DIGI2] | "
               "/d|/disconnect | /q|/quit|/exit | /h|/help [-v] | "
               "/clear|/cls | "
-              "/unproto DEST [via DIGI1,DIGI2] [msg...] | /upexit")
+              "/unproto DEST [via DIGI1,DIGI2] [msg...] | /upexit\n")
 
 HELP_VERBOSE = """\
 SPT — Simple Packet Terminal (commands)
@@ -535,7 +519,7 @@ STATUS & SETTINGS
       Locally echo what you type as it is transmitted.
 
   /crlf on|off
-      Choose line ending for transmitted text. ON = CRLF (\\r\\n), OFF = CR (\\r).
+      Choose line ending for transmitted text. ON = CRLF (\r\n), OFF = CR (\r).
 
   /retries N
       Set the number of times to retry SABM if no UA response is received.
@@ -569,7 +553,11 @@ def run(mycall, target, host, port):
     # Clear on program start and show banner/header
     clear_screen()
     print_banner(mycall, host, port)
-    logf = open(f"session-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log", "w", buffering=1)
+
+    # --- simple session logging (toggle-able) ---
+    log_path = f"session-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    logf = open(log_path, "w", buffering=1)
+    logging_enabled = True  # default ON
 
     # readline history setup (TTY only)
     if HAVE_READLINE and sys.stdin.isatty():
@@ -589,6 +577,19 @@ def run(mycall, target, host, port):
         clear_screen()
         print_header()
 
+    # --- one-line status printer (reused) ---
+    def status_line() -> str:
+        echo_on = "on" if getattr(link, "local_echo", True) else "off"
+        crlf_on = "on" if getattr(link, "tx_newline", "\r") == "\r\n" else "off"
+        up      = "on" if link.unproto_mode else "off"
+        up_to   = link.unproto_dest or "(none)"
+        up_via  = ",".join(link.unproto_digis) if link.unproto_digis else "[]"
+        return (f"\n[STATUS] state={link.state} dest={link.dest or '(none)'} "
+                f"vs={link.vs} vr={link.vr} digis={link.digis or '[]'} "
+                f"echo={echo_on} crlf={crlf_on} retries={link.retries} "
+                f"unproto={up} to={up_to} via={up_via} "
+                f"log={'on' if logging_enabled else 'off'} file={log_path}\n\n")
+
     # --- dynamic prompt builder with color ---
     def prompt() -> str:
         if link.state == "CONNECTED" and link.dest:
@@ -599,13 +600,15 @@ def run(mycall, target, host, port):
 
     # --- incoming lines: overwrite current input line, then redraw prompt ---
     def emit(s: str):
-        try:
-            logf.write(s + "\n")
-        except Exception:
-            pass
+        if logging_enabled and logf:
+            try:
+                logf.write(s + "\n")
+            except Exception:
+                pass
         with link.ui_lock:
             if _supports_ansi():
-                sys.stdout.write("\r\033[2K" + s + "\n")
+                #sys.stdout.write("\r\033[2K" + s + "\n")
+                sys.stdout.write("\r\033[2K" + "\033[33m" + s + "\033[0m\n")
                 sys.stdout.write("\033[2K" + prompt())
             else:
                 sys.stdout.write("\r" + s + "\n" + prompt())
@@ -615,6 +618,7 @@ def run(mycall, target, host, port):
     link.on_connected_ui = ui_clear_and_header
     link.connect()
     print_header()
+    print(status_line())  # show current settings immediately
     if target:
         print(f"Tip: /c {target}")
 
@@ -690,7 +694,7 @@ def run(mycall, target, host, port):
                 link.call(dest)
                 continue
 
-            #retries
+            # retries
             if ftok == "/retries":
                 if len(toks) == 2 and toks[1].isdigit():
                     link.retries = max(1, int(toks[1]))  # must be >=1
@@ -760,14 +764,7 @@ def run(mycall, target, host, port):
 
             # status
             if ftok == "/status":
-                echo_on = "on" if getattr(link, "local_echo", True) else "off"
-                crlf_on = "on" if getattr(link, "tx_newline", "\r") == "\r\n" else "off"
-                up = "on" if link.unproto_mode else "off"
-                up_to = link.unproto_dest or "(none)"
-                up_via = ",".join(link.unproto_digis) if link.unproto_digis else "[]"
-                print(f"[STATUS] state={link.state} dest={link.dest or '(none)'} vs={link.vs} vr={link.vr} "
-                      f"digis={link.digis or '[]'} echo={echo_on} crlf={crlf_on} "
-                      f"unproto={up} to={up_to} via={up_via}")
+                print(status_line())
                 continue
 
             # debug
@@ -795,6 +792,17 @@ def run(mycall, target, host, port):
                     print("Usage: /crlf on|off")
                 continue
 
+            # log on|off|show
+            if ftok == "/log":
+                if len(toks) == 1:
+                    print(f"[LOG] {'ON' if logging_enabled else 'OFF'} (file: {log_path})")
+                elif len(toks) == 2 and toks[1] in ("on", "off"):
+                    logging_enabled = (toks[1] == "on")
+                    print(f"[LOG] {'ON' if logging_enabled else 'OFF'} (file: {log_path})")
+                else:
+                    print("Usage: /log on|off  (or just /log to show)")
+                continue
+
             # help
             if ftok in ("/h", "/help"):
                 if "-v" in toks or "verbose" in toks:
@@ -814,15 +822,17 @@ def run(mycall, target, host, port):
 
             # Otherwise, send user text on the connected link
             link.send_text(line)
-            try:
-                logf.write("> " + line + "\n")
-            except Exception:
-                pass
+            if logging_enabled and logf:
+                try:
+                    logf.write("> " + line + "\n")
+                except Exception:
+                    pass
 
     except KeyboardInterrupt:
         pass
     finally:
-        try: logf.close()
+        try:
+            if logf: logf.close()
         except Exception: pass
         link.close()
         print("\n⟨KISS AX.25 Terminal⟩ bye.")
