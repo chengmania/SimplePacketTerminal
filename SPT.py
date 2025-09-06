@@ -192,6 +192,7 @@ class KissLink:
         # Pending user lines to send after UA
         self._pending_lock = threading.Lock()
         self._pending_after_connect = []
+        self.retries = 3   # default retries
 
     # ----- socket lifecycle -----
     def connect(self):
@@ -273,11 +274,29 @@ class KissLink:
         self.dest = dest.upper()
         self.vs = 0; self.vr = 0
         self.state = "AWAIT_UA"
-        # Clear any old pending
         with self._pending_lock:
             self._pending_after_connect.clear()
-        self._send_sabm(self.dest)
-        self.on_line(f"[LINK] Calling {self.dest}" + (f" via {','.join(self.digis)}" if self.digis else "") + " …")
+
+        def attempt_connect():
+            for attempt in range(self.retries):
+                if self.state != "AWAIT_UA":
+                    return  # got UA or aborted
+                self._send_sabm(self.dest)
+                self.on_line(f"[LINK] Calling {self.dest} (attempt {attempt+1}/{self.retries})" +
+                            (f" via {','.join(self.digis)}" if self.digis else "") + " …")
+                # wait for UA up to 5 sec
+                for _ in range(50):
+                    if self.state != "AWAIT_UA":
+                        return
+                    time.sleep(0.1)
+            # If we get here, retries exhausted
+            if self.state == "AWAIT_UA":
+                self.state = "DISCONNECTED"
+                self.on_line(f"[LINK] No response from {self.dest} after {self.retries} retries.")
+                self.dest = None
+
+        threading.Thread(target=attempt_connect, daemon=True).start()
+
 
     def disconnect(self):
         if self.state == "CONNECTED":
@@ -518,6 +537,10 @@ STATUS & SETTINGS
   /crlf on|off
       Choose line ending for transmitted text. ON = CRLF (\\r\\n), OFF = CR (\\r).
 
+  /retries N
+      Set the number of times to retry SABM if no UA response is received.
+      Default is 3.
+
 UNCONNECTED (UI) FRAMES
   /unproto DEST [via DIGI1,DIGI2] message...
       Send an AX.25 UI frame (PID F0) to DEST, optionally via digipeaters.
@@ -665,6 +688,15 @@ def run(mycall, target, host, port):
                     continue
                 link.digis = digis
                 link.call(dest)
+                continue
+
+            #retries
+            if ftok == "/retries":
+                if len(toks) == 2 and toks[1].isdigit():
+                    link.retries = max(1, int(toks[1]))  # must be >=1
+                    print(f"[RETRIES] Set to {link.retries}")
+                else:
+                    print(f"[RETRIES] Currently {link.retries}. Usage: /retries N")
                 continue
 
             # clear screen
