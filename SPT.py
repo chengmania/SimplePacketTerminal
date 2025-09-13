@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 """
-SPT — Simple Packet Terminal (KISS + AX.25) — minimal, stdlib-only.
+SPT_0_9a.py - Simple Packet Terminal (KISS + AX.25, mod-8)
+
+Changes in this 'a' build:
+- Added per-line RX coloring (I-frame text and RX UI monitor lines)
+- Kept prompt color separate from RX color
+- Added /color command to change 'prompt' or 'rx' color at runtime
+- Non-payload system/link messages keep default terminal color
+
+Based on SPT_0_9.py (KC3SMW)
 """
 
 import socket, sys, threading, time, datetime
 import re, os, atexit
-
-# Try to enable readline-based history/editing (Linux/macOS; optional on Windows)
-try:
-    import readline  # type: ignore
-    HAVE_READLINE = True
-except Exception:
-    HAVE_READLINE = False
+from typing import List, Optional
 
 # ---------- Pager prompt patterns ----------
 PROMPT_PATTERNS = [
-    re.compile(r"<\s*A\s*>?bort,\s*<\s*CR\s*>\s*Continue\.\.?>", re.I),
-    re.compile(r"press\s*<\s*cr\s*>\s*to\s*continue", re.I),
+    # Common BBS pager prompts - more flexible patterns
+    re.compile(r".*<\s*CR\s*>.*[Cc]ontinue.*", re.I | re.DOTALL),
+    re.compile(r".*[Pp]ress.*<\s*CR\s*>.*[Cc]ontinue.*", re.I | re.DOTALL),
+    re.compile(r".*<\s*A\s*>.*[Aa]bort.*<\s*CR\s*>.*[Cc]ontinue.*", re.I | re.DOTALL),
+    re.compile(r".*\(A\)bort.*\(CR\).*[Cc]ontinue.*", re.I | re.DOTALL),
+    re.compile(r".*More\s*\(Y/n\).*", re.I),
+    re.compile(r".*--More--.*", re.I),
+    re.compile(r".*Press any key.*", re.I),
 ]
 
 # ---------- Config ----------
 KISS_HOST_DEFAULT = "127.0.0.1"
-KISS_PORT_DEFAULT = 8001          # Direwolf: KISSPORT 8001
+KISS_PORT_DEFAULT = 8001          # Direwolf default
 DEBUG = False
 
 # ---------- KISS constants ----------
@@ -32,12 +40,13 @@ TFESC = 0xDD
 KISS_DATA = 0x00                  # port 0 data
 
 # ---------- AX.25 control constants (mod-8) ----------
-CTRL_SABM = 0x2F                  # P/F bit may be set (0x10)
-CTRL_UA   = 0x63
-CTRL_DISC = 0x43
-CTRL_DM   = 0x0F
-CTRL_FRMR = 0x87
-CTRL_UI   = 0x03                  # Unnumbered Information (UI)
+CTRL_SABM  = 0x2F                 # v2.0
+CTRL_SABME = 0x6F                 # v2.2
+CTRL_UA    = 0x63
+CTRL_DISC  = 0x43
+CTRL_DM    = 0x0F
+CTRL_FRMR  = 0x87
+CTRL_UI    = 0x03                 # Unnumbered Information (UI)
 
 S_RR  = 0x01
 S_RNR = 0x05
@@ -52,11 +61,16 @@ def dprint(*a):
 def _supports_ansi() -> bool:
     return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb" and "NO_COLOR" not in os.environ
 
-PROMPT_COLOR = "\033[96m"  # bright cyan (nice on black)
+# Make these variables so they can be adjusted at runtime with /color
+PROMPT_COLOR = "\033[96m"  # bright cyan
+RX_COLOR     = "\033[93m"  # bright green for received lines
 RESET_COLOR  = "\033[0m"
 
-def colorize(s: str) -> str:
-    return (PROMPT_COLOR + s + RESET_COLOR) if _supports_ansi() else s
+def colorize_prompt(s: str) -> str:
+    return (PROMPT_COLOR + s + RESET_COLOR) if _supports_ansi() and PROMPT_COLOR else s
+
+def colorize_rx(s: str) -> str:
+    return (RX_COLOR + s + RESET_COLOR) if _supports_ansi() and RX_COLOR else s
 
 def clear_screen():
     if _supports_ansi():
@@ -75,27 +89,35 @@ def parse_call(call: str):
         base, ssid = call, 0
     return base, ssid
 
-def ax25_addr_bytes(call: str, last: bool, command: bool):
-    base, ssid = parse_call(call)
-    base = (base + "      ")[:6]
+def ax25_addr_bytes(call: str, set_last: bool, command: bool, has_been_repeated: bool = False) -> bytes:
+    """Build AX.25 address field with digipeater support"""
+    call_up = call.upper().split('-')[0]
+    ssid = int(call.split('-')[1]) if '-' in call else 0
+    call_up = (call_up + ' ' * 6)[:6]
     b = bytearray(7)
-    for i, ch in enumerate(base):
+    for i, ch in enumerate(call_up):
         b[i] = (ord(ch) << 1) & 0xFE
     ssid_byte = 0x60 | ((ssid & 0x0F) << 1)
-    if command: ssid_byte |= 0x80
-    if last:    ssid_byte |= 0x01
+    if command:
+        ssid_byte |= 0x80  # C-bit orientation
+    if has_been_repeated:
+        ssid_byte |= 0x80  # H-bit for digipeaters that have been used
+    if set_last:
+        ssid_byte |= 0x01
     b[6] = ssid_byte
     return bytes(b)
 
-def build_ax25_header(dest: str, src: str, digis=None, cmd=True):
+def build_ax25_header(dest: str, src: str, digis, *, cmd: bool = True) -> bytes:
+    """Build address field with explicit Command/Response orientation and digipeater support."""
     digis = digis or []
     parts = [
-        ax25_addr_bytes(dest, last=False, command=cmd),
-        ax25_addr_bytes(src,  last=(len(digis) == 0), command=not cmd),
+        ax25_addr_bytes(dest, set_last=False, command=cmd),
+        ax25_addr_bytes(src,  set_last=(len(digis) == 0), command=not cmd),
     ]
     for i, d in enumerate(digis):
-        parts.append(ax25_addr_bytes(d, last=(i == len(digis) - 1), command=False))
-    return b"".join(parts)
+        # For UI frames through digipeaters, don't set H-bit initially
+        parts.append(ax25_addr_bytes(d, set_last=(i == len(digis) - 1), command=False, has_been_repeated=False))
+    return b''.join(parts)
 
 def decode_addrs(frame: bytes):
     if len(frame) < 14: return ("", "", 0)
@@ -114,10 +136,6 @@ def decode_addrs(frame: bytes):
                 break
             i += 7
     return dest, src, i
-
-def print_banner(mycall: str, host: str, port: int):
-    print(BANNER)
-    print(f"⟨KISS⟩ Using {host}:{port}  |  MYCALL={mycall}\n")
 
 # ---------- KISS framing ----------
 def kiss_escape(payload: bytes) -> bytes:
@@ -148,47 +166,64 @@ class KissLink:
     def __init__(self, host, port, mycall):
         self.host, self.port = host, port
         self.mycall = mycall.upper()
-        self.sock = None
+        self.sock: Optional[socket.socket] = None
         self.alive = False
-        self.rx_thread = None
-        self.on_line = print
+        self.rx_thread: Optional[threading.Thread] = None
+        self.on_line = print          # generic emitter (system/link msgs)
+        self.on_rx_line = None        # NEW: payload emitter (colored)
         # AX.25 state
         self.state = "DISCONNECTED"
-        self.dest = None
+        self.dest: Optional[str] = None
         self.vs = 0
         self.vr = 0
         self.appbuf = ""
-        self.digis = []
+        self.digis: List[str] = []
         # QoL
-        self.local_echo = True
-        self.tx_newline = "\r"
+        self.local_echo = False
+        self.tx_newline = "\r"  # tip: /crlf on if your node prefers CRLF
         # Keepalive
         self._ka_alive = False
-        self._ka_thread = None
+        self._ka_thread: Optional[threading.Thread] = None
         self.more_prompt_pending = False
         self.ui_lock = threading.Lock()
         # Unproto state
         self.unproto_mode = False
-        self.unproto_dest = None
-        self.unproto_digis = []
+        self.unproto_dest: Optional[str] = None
+        self.unproto_digis: List[str] = []
         # UI hook to clear & print header when we connect
         self.on_connected_ui = None
         # Pending user lines to send after UA
         self._pending_lock = threading.Lock()
-        self._pending_after_connect = []
-        self.retries = 3   # default retries
+        self._pending_after_connect: List[str] = []
+        # Connect retries
+        self.retries = 3
+        self.retry_wait = 2.5  # seconds to wait for UA per attempt
+        # Handshake latch to avoid re-SABM storms
+        self._ua_event = threading.Event()
+        # One-shot fallback latch on DM
+        self._dm_fallback_tried = False
+        self._recent_tail = ""      # rolling tail of recent rx text (for prompt detection)
+        self._recent_tail_max = 512 # keep last N chars - increased for better pattern matching
 
     # ----- socket lifecycle -----
     def connect(self):
-        self.sock = socket.create_connection((self.host, self.port), timeout=5)
-        self.sock.settimeout(0.2)
-        self.alive = True
-        self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
-        self.rx_thread.start()
-        self.on_line(f"[KISS] Connected to {self.host}:{self.port}")
-        self._ka_alive = True
-        self._ka_thread = threading.Thread(target=self._ka_loop, daemon=True)
-        self._ka_thread.start()
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=5)
+            self.sock.settimeout(0.2)
+            self.alive = True
+            self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+            self.rx_thread.start()
+            # Completely silent - no output at all during startup
+            self._ka_alive = True
+            self._ka_thread = threading.Thread(target=self._ka_loop, daemon=True)
+            self._ka_thread.start()
+        except Exception as e:
+            # Only show errors
+            if hasattr(self, 'on_line') and self.on_line:
+                self.on_line(f"[ERROR] KISS connection failed: {e}")
+            else:
+                print(f"[ERROR] KISS connection failed: {e}")
+            raise
 
     def close(self):
         self.alive = False
@@ -202,42 +237,93 @@ class KissLink:
 
     # ----- AX.25 frame TX helpers -----
     def _send_ax25(self, raw: bytes, port=0):
+        if not self.sock: return
         frame = kiss_wrap_data(port, raw)
         self.sock.sendall(frame)
         dprint("TX", raw.hex())
 
     def _send_sabm(self, dest):
-        hdr = build_ax25_header(dest, self.mycall, self.digis)
-        ctrl = CTRL_SABM | 0x10
+        hdr = build_ax25_header(dest, self.mycall, self.digis, cmd=True)
+        ctrl = CTRL_SABM | 0x10  # P=1
+        self._send_ax25(hdr + bytes([ctrl]))
+
+    def _send_sabme(self, dest):
+        hdr = build_ax25_header(dest, self.mycall, self.digis, cmd=True)
+        ctrl = CTRL_SABME | 0x10  # P=1
         self._send_ax25(hdr + bytes([ctrl]))
 
     def _send_disc(self):
         if not self.dest: return
-        hdr = build_ax25_header(self.dest, self.mycall, self.digis)
-        ctrl = CTRL_DISC | 0x10
+        hdr = build_ax25_header(self.dest, self.mycall, self.digis, cmd=True)
+        ctrl = CTRL_DISC | 0x10  # P=1
         self._send_ax25(hdr + bytes([ctrl]))
 
-    def _send_rr(self, pf=0):
+    def _send_rr(self, is_command: bool, pf: int):
+        """Send RR as command (poll) or response (final). n(r) = vr; do NOT advance vr here."""
         if not self.dest: return
-        hdr = build_ax25_header(self.dest, self.mycall, self.digis)
-        ctrl = (S_RR | ((self.vr & 0x07) << 5))
-        if pf: ctrl |= 0x10
+        hdr = build_ax25_header(self.dest, self.mycall, self.digis, cmd=is_command)
+        ctrl = (S_RR | ((self.vr & 0x07) << 5))  # n(r)=vr
+        if pf:
+            ctrl |= 0x10  # P when command, F when response
+        self._send_ax25(hdr + bytes([ctrl]))
+
+    def _send_ua(self, final=1):
+        if not self.dest: return
+        hdr = build_ax25_header(self.dest, self.mycall, self.digis, cmd=False)  # response
+        ctrl = CTRL_UA | (0x10 if final else 0)
         self._send_ax25(hdr + bytes([ctrl]))
 
     def _send_i(self, text: bytes):
         if not self.dest or self.state != "CONNECTED": return
-        hdr = build_ax25_header(self.dest, self.mycall, self.digis)
+        hdr = build_ax25_header(self.dest, self.mycall, self.digis, cmd=True)
         ctrl = ((self.vs & 0x07) << 1) | ((self.vr & 0x07) << 5)
         self.vs = (self.vs + 1) & 7
         pkt = hdr + bytes([ctrl, PID_NO_L3]) + text
         self._send_ax25(pkt)
 
     def _send_ui(self, dest: str, message: bytes, digis=None):
+        """Send UI frame with proper digipeater support"""
         digis = digis or []
-        hdr = build_ax25_header(dest.upper(), self.mycall, digis)
+        # For UI frames, use command=True to ensure proper C-bit setting
+        hdr = build_ax25_header(dest.upper(), self.mycall, digis, cmd=True)
         ctrl = CTRL_UI
         pkt = hdr + bytes([ctrl, PID_NO_L3]) + message
         self._send_ax25(pkt)
+
+    def _update_recent_tail(self, s: str):
+        """Update the rolling tail buffer used for pager detection"""
+        if not s:
+            return
+        self._recent_tail = (self._recent_tail + s)[-self._recent_tail_max:]
+
+    def _detect_pager_prompt(self, text: str = None) -> bool:
+        """Improved pager detection with better pattern matching"""
+        if text:
+            # Check the specific text first
+            test_text = text.strip()
+            if test_text:
+                for pat in PROMPT_PATTERNS:
+                    if pat.search(test_text):
+                        dprint(f"PAGER: Found prompt pattern in line: '{test_text}'")
+                        return True
+
+        # Also check the rolling tail for patterns that might span multiple lines
+        tail = self._recent_tail.strip()
+        if tail:
+            # Fast check for common patterns
+            tail_lower = tail.lower()
+            if (("abort" in tail_lower and "continue" in tail_lower) or
+                ("press" in tail_lower and "continue" in tail_lower) or
+                ("more" in tail_lower) or
+                ("--more--" in tail_lower)):
+
+                # Now use regex for precise matching
+                for pat in PROMPT_PATTERNS:
+                    if pat.search(tail):
+                        dprint(f"PAGER: Found prompt pattern in tail: '{tail[-100:]}'")
+                        return True
+
+        return False
 
     # ----- Handshake queue helpers -----
     def queue_after_connect(self, line: str):
@@ -249,38 +335,49 @@ class KissLink:
             lines = self._pending_after_connect[:]
             self._pending_after_connect.clear()
         if lines:
-            self.on_line(f"[SEND] Flushing {len(lines)} queued line(s) after connect …")
+            self.on_line(f"[SEND] Flushing {len(lines)} queued line(s) after connect ...")
             for ln in lines:
                 self.send_text(ln)
 
+    def _incoming_is_command(self, raw: bytes) -> bool:
+        # For frames we receive, the peer sets C=1 in DEST SSID for a command.
+        return len(raw) >= 7 and (raw[6] & 0x80) != 0
+
     # ----- Public ops -----
-    def call(self, dest):
+    def call(self, dest: str):
         self.dest = dest.upper()
-        self.vs = 0; self.vr = 0
+        self.vs = 0
+        self.vr = 0
         self.state = "AWAIT_UA"
+        self._ua_event.clear()
+        self._dm_fallback_tried = False
+        # Clear any old pending
         with self._pending_lock:
             self._pending_after_connect.clear()
 
-        def attempt_connect():
-            for attempt in range(self.retries):
-                if self.state != "AWAIT_UA":
-                    return  # got UA or aborted
+        attempts = max(1, int(getattr(self, "retries", 3)))
+        for i in range(1, attempts + 1):
+            # probe v2.2 first, then fallback attempts use SABM
+            if i == 1:
+                self._send_sabme(self.dest)
+                probe = "SABME"
+            else:
                 self._send_sabm(self.dest)
-                self.on_line(f"[LINK] Calling {self.dest} (attempt {attempt+1}/{self.retries})" +
-                            (f" via {','.join(self.digis)}" if self.digis else "") + " …")
-                # wait for UA up to 5 sec
-                for _ in range(50):
-                    if self.state != "AWAIT_UA":
-                        return
-                    time.sleep(0.1)
-            # If we get here, retries exhausted
-            if self.state == "AWAIT_UA":
-                self.state = "DISCONNECTED"
-                self.on_line(f"[LINK] No response from {self.dest} after {self.retries} retries.")
-                self.dest = None
+                probe = "SABM"
+            self.on_line(f"[LINK] Calling {self.dest}" +
+                         (f" via {','.join(self.digis)}" if self.digis else "") +
+                         f" (attempt {i}/{attempts}, {probe}) ...")
+            t0 = time.time()
+            # wait for UA (or implicit I-frame banner) with latch
+            while time.time() - t0 < self.retry_wait:
+                if self.state == "CONNECTED" or self._ua_event.is_set():
+                    return
+                time.sleep(0.05)
 
-        threading.Thread(target=attempt_connect, daemon=True).start()
-
+        # no UA
+        self.on_line("[LINK] No response. Giving up.")
+        self.state = "DISCONNECTED"
+        self.dest = None
 
     def disconnect(self):
         if self.state == "CONNECTED":
@@ -299,6 +396,7 @@ class KissLink:
         self._send_i(wire)
 
     def send_unproto(self, dest: str, message: str, digis=None):
+        """Send unproto message with digipeater support"""
         wire = message.encode("utf-8", errors="replace")
         self._send_ui(dest, wire, digis=digis or [])
         via = f" via {','.join(digis)}" if digis else ""
@@ -306,10 +404,17 @@ class KissLink:
 
     # ----- Keepalive -----
     def _ka_loop(self):
+        # We originate a periodic POLL (RR cmd with P=1) only when connected.
+        # Reduce frequency during paging to avoid interfering
         while self._ka_alive:
             if self.state == "CONNECTED":
-                self._send_rr(pf=1)
-            time.sleep(60)
+                # Don't send keepalives during paging interactions
+                if not getattr(self, "more_prompt_pending", False):
+                    dprint("Keepalive: Sending RR poll")
+                    self._send_rr(is_command=True, pf=1)
+                else:
+                    dprint("Keepalive: Skipping due to pending pager prompt")
+            time.sleep(120)  # Increased from 60 to 120 seconds
 
     # ----- RX path -----
     def _rx_loop(self):
@@ -354,241 +459,292 @@ class KissLink:
         self.alive = False
 
     def _check_more_prompt(self, text: str):
-        t = text.strip()
-        for pat in PROMPT_PATTERNS:
-            if pat.search(t):
-                self.more_prompt_pending = True
-                return
-        if t:
-            self.more_prompt_pending = False
+        """Check if text contains a pager prompt and update state"""
+        # Update rolling tail first
+        self._update_recent_tail(text)
 
-    def _send_ua(self, final=1):
-        if not self.dest:
-            return
-        hdr = build_ax25_header(self.dest, self.mycall, self.digis, cmd=False)
-        ctrl = CTRL_UA | (0x10 if final else 0)
-        self._send_ax25(hdr + bytes([ctrl]))
+        # Check for pager prompts
+        if self._detect_pager_prompt(text):
+            self.more_prompt_pending = True
+            dprint(f"PAGER: Detected prompt in: '{text.strip()}'")
 
+        # Also check for disconnect indicators that might be false positives
+        text_lower = text.lower().strip()
+        if any(word in text_lower for word in ['disconnect', 'goodbye', 'bye', '73']):
+            dprint(f"PAGER: Potential disconnect text: '{text.strip()}'")
+        # Do NOT clear here on non-empty text; we clear only after we act on it.
+
+    # ----- AX.25 handlers -----
     def _handle_ax25(self, raw: bytes):
         dprint("RX", raw.hex())
         dest, src, i = decode_addrs(raw)
-        if i == 0 or i >= len(raw): return
+        if i == 0 or i >= len(raw):
+            return
         ctrl = raw[i]
+        base = ctrl & 0xEF  # clear P/F for type tests
+
+        # Debug frame info
+        if DEBUG:
+            frame_type = "Unknown"
+            if (ctrl & 0x01) == 0:
+                frame_type = f"I-frame ns={(ctrl >> 1) & 0x07} nr={(ctrl >> 5) & 0x07}"
+            elif base == CTRL_UA:
+                frame_type = "UA"
+            elif base == CTRL_DM:
+                frame_type = "DM"
+            elif base == CTRL_DISC:
+                frame_type = "DISC"
+            elif base == CTRL_UI:
+                frame_type = "UI"
+            elif (ctrl & 0x0F) in (S_RR, S_RNR, S_REJ):
+                frame_type = f"S-frame {ctrl & 0x0F:02x}"
+            dprint(f"Frame: {src}->{dest} {frame_type} state={self.state}")
 
         # I-frame
         if (ctrl & 0x01) == 0:
             ns = (ctrl >> 1) & 0x07
             pf_in = 1 if (ctrl & 0x10) else 0
-            if i+1 >= len(raw): return
+            if i + 1 >= len(raw):
+                return
             info = raw[i+2:]
 
-            if ns == self.vr:
-                self.vr = (self.vr + 1) & 7
-                self._send_rr(pf=pf_in)
+            # If banner arrives immediately after SABM/UA, latch the link
+            if self.state == "AWAIT_UA":
+                self._ua_event.set()
+                self.state = "CONNECTED"
+                if callable(self.on_connected_ui):
+                    self.on_connected_ui()
+                self.on_line(f"[LINK] CONNECTED to {self.dest} (implicit)")
+                # NOTE: flush-after-connect occurs after we finish printing banner text
+                # (we'll let the app print first lines, then user can type)
 
+            if ns == self.vr:
+                # Accept in-order I-frame, advance vr, ACK with RR (mirror P/F).
+                self.vr = (self.vr + 1) & 7
+                self._send_rr(is_command=False, pf=pf_in)   # respond (F mirrors P)
+
+                # text handling
                 chunk = info.decode("utf-8", errors="replace")
                 chunk = chunk.replace("\r\n", "\n").replace("\r", "\n")
                 self.appbuf += chunk
 
                 while "\n" in self.appbuf:
                     line, self.appbuf = self.appbuf.split("\n", 1)
-                    self.on_line(line.rstrip())
+                    line = line.rstrip()
+                    if callable(self.on_rx_line):
+                        self.on_rx_line(line)
+                    else:
+                        self.on_line(line)
                     self._check_more_prompt(line)
 
+                # If burst ended (P/F=1) and we still have a partial:
                 if pf_in and self.appbuf:
-                    flushed = self.appbuf
-                    self.on_line(flushed.rstrip())
-                    self._check_more_prompt(flushed)
-                    self.appbuf = ""
+                    peek = self.appbuf.rstrip()
+                    # Always display partial content at end of burst
+                    if peek:
+                        if callable(self.on_rx_line):
+                            self.on_rx_line(peek)
+                        else:
+                            self.on_line(peek)
+                        self._check_more_prompt(peek)
+                        self.appbuf = ""
             else:
-                self._send_rr(pf=0)
+                # Out-of-sequence: ACK current vr without moving it.
+                self._send_rr(is_command=False, pf=0)
             return
 
-        base = ctrl & 0xEF  # ignore P/F bit
-        # --- UI frames (UNPROTO) ---
+        # UI frames (monitor mode)
         if base == CTRL_UI:
-            # Only "monitor" UI when in persistent unproto mode
             if not getattr(self, "unproto_mode", False):
                 return
-
-            # PID at i+1, info after that
             if i + 1 >= len(raw):
                 return
             pid = raw[i+1]
             info = raw[i+2:]
-
-            # We usually expect PID F0 (text), but still display whatever arrives.
             text = info.decode("utf-8", errors="replace")
             text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
-
-            # Show a clean monitor-style line
-            self.on_line(f"[RX UI] {src} > {dest} :: {text}")
+            msg = f"[RX UI] {src} > {dest} :: {text}"
+            if callable(self.on_rx_line):
+                self.on_rx_line(msg)
+            else:
+                self.on_line(msg)
             return
 
-        # U-frames
+        # --- U-frames ---
         if base == CTRL_UA:
+            self._ua_event.set()
             if self.state == "AWAIT_UA":
                 self.state = "CONNECTED"
-                # Clear screen/header before node text
                 if callable(self.on_connected_ui):
                     self.on_connected_ui()
-                self.on_line(f"[LINK] CONNECTED to {self.dest} \n \n")
-                # Flush any queued user lines from handshake period
+                self.on_line(f"[LINK] CONNECTED to {self.dest}")
                 self._flush_after_connect()
             return
+
         if base == CTRL_DM:
+            # DM during handshake -> fallback to SABM once
+            if self.state == "AWAIT_UA" and self.dest and not self._dm_fallback_tried:
+                self.on_line("[LINK] Peer sent DM; retrying with SABM (v2.0)...")
+                self._dm_fallback_tried = True
+                self._send_sabm(self.dest)
+                return
             self.on_line("[LINK] Disconnected mode (DM) from peer).")
-            self.state = "DISCONNECTED"; self.dest = None; self.appbuf = ""
+            self.state = "DISCONNECTED"
+            self.dest = None
+            self.appbuf = ""
             return
+
         if base == CTRL_FRMR:
             self.on_line("[LINK] FRMR (frame reject) from peer.")
+            # If we were probing with SABME, fall back to SABM (v2.0)
+            if self.state == "AWAIT_UA" and self.dest:
+                self._send_sabm(self.dest)
             return
+
         if base == CTRL_DISC:
             pf_in = 1 if (ctrl & 0x10) else 0
-            self._send_ua(final=pf_in or 1)
-            self.state = "DISCONNECTED"; self.dest = None; self.appbuf = ""
-            self.on_line("[LINK] Peer requested DISC.")
+            # Only respond to DISC if we're actually connected
+            # Some BBS systems send spurious DISC frames during paging
+            if self.state == "CONNECTED":
+                self._send_ua(final=pf_in or 1)
+                self.state = "DISCONNECTED"
+                self.dest = None
+                self.appbuf = ""
+                self.on_line("[LINK] Peer requested DISC - disconnected.")
+            else:
+                dprint(f"DISC: Ignoring DISC in state {self.state}")
             return
 
-        # S-frames
+        # --- S-frames (RR/RNR/REJ) ---
         s_code = ctrl & 0x0F
         if s_code in (S_RR, S_RNR, S_REJ):
+            pf_in = 1 if (ctrl & 0x10) else 0
+            nr = (ctrl >> 5) & 0x07
+            dprint(f"S-frame: code={s_code:02x} nr={nr} pf={pf_in}")
+
+            # Update our send sequence based on their ACK
+            if s_code == S_RR:
+                # They're acknowledging up to nr-1, but don't change our vr
+                pass
+
+            if pf_in and self._incoming_is_command(raw):
+                # They polled us (Command + P=1) -> answer once with Response + F=1
+                dprint("S-frame: Responding to poll")
+                self._send_rr(is_command=False, pf=1)
             return
 
-# ---------- Terminal UI ----------
-BANNER = (
-    "SPT — Simple Packet Terminal\n"
-    "An open-source KISS/AX.25 terminal for amateur radio.\n"
-    "Created by Chengmania (KC3SMW).\n"
-    "\n"
-    "• Works with Direwolf (KISS TCP)\n"
-    "• Clean, pager-friendly display and colored prompt\n"
-    "• Connected mode (/connect) and UNPROTO (UI) frames\n"
-    "\n"
-    "Type /help for a quick command list, or /help -v for details.\n"
-)
-
-HELP_BRIEF = ("\nCommands: /c|/connect CALL [via DIGI1,DIGI2] | "
-              "/d|/disconnect | /q|/quit|/exit | /h|/help [-v] | "
-              "/clear|/cls | "
-              "/unproto DEST [via DIGI1,DIGI2] [msg...] | /upexit\n")
-
-HELP_VERBOSE = """\
-SPT — Simple Packet Terminal (commands)
-
-USAGE
-  SPT.py MYCALL [TARGET] [HOST] [PORT]
-  SPT.py MYCALL TARGET HOST:PORT
-
-LINK COMMANDS
-  /c CALL [via DIGI1,DIGI2]
-  /connect CALL [via DIGI1,DIGI2]
-      Establish an AX.25 connected (LAPB) session to CALL. Optional digipeaters
-      are comma-separated after 'via'.
-      Example: /c KC3SMW-7 via WIDE1-1,WIDE2-1
-
-  /d
-  /disconnect
-      Politely request disconnect (DISC). Prompt updates immediately.
-
-  /q
-  /quit
-  /exit
-      Exit the program. If connected, SPT sends DISC first.
-
-SCREEN & HELP
-  /clear
-  /cls
-      Clear the screen and reprint the header and command summary.
-
-  /h
-  /help
-      Show the one-line command summary.
-
-  /help -v
-      Show this detailed help.
-
-STATUS & SETTINGS
-  /status
-      Show link state, destination, sequence numbers, digi path and I/O options.
-
-  /debug
-      Toggle debug logging of raw frames.
-
-  /echo on|off
-      Locally echo what you type as it is transmitted.
-
-  /crlf on|off
-      Choose line ending for transmitted text. ON = CRLF (\r\n), OFF = CR (\r).
-
-  /retries N
-      Set the number of times to retry SABM if no UA response is received.
-      Default is 3.
-
-UNCONNECTED (UI) FRAMES
-  /unproto DEST [via DIGI1,DIGI2] message...
-      Send an AX.25 UI frame (PID F0) to DEST, optionally via digipeaters.
-
-  /unproto DEST [via DIGI1,DIGI2]
-      Enter persistent UNPROTO mode to DEST (and optional digis). Every line
-      that doesn't start with '/' will be sent as a UI frame.
-
-  /upexit | /upoff | /upstop | /unproto off|stop|end|exit
-      Exit persistent UNPROTO mode.
-
-PAGER PROMPTS
-  When the BBS shows: "<A>bort, <CR> Continue..>"
-    - Press Enter to continue (SPT sends a bare CR)
-    - Type 'A' (upper or lower) to abort
-
-NOTE
-  Unknown slash-commands are forwarded to the peer when connected (so BBS
-  commands like /ex still work). When not connected, unknown slash-commands
-  show: command not found; use /h for list of commands
+# ---------- UI / CLI ----------
+HELP = """\
+Commands:
+  /c | /connect CALL [via DIGI1,DIGI2]   Connect (AX.25)
+  /d | /disconnect                       Disconnect
+  /unproto DEST [via DIGI1,DIGI2] [msg]  Send UI frame; no msg -> enter unproto mode
+  /upexit                                 Exit unproto mode
+  /echo on|off                            Local echo
+  /crlf on|off                            Send CRLF instead of CR
+  /retries N                              Set connect retries (default 3)
+  /debug                                  Toggle debug
+  /clear | /cls                           Clear screen
+  /status                                 Show link status
+  /color rx <name>|prompt <name>          Set RX/prompt color (e.g., brightyellow)
+  /h | /help [-v]                         Show help (use -v for verbose)
+  /q | /quit | /exit                      Quit
 """
 
-def run(mycall, target, host, port):
-    link = KissLink(host, port, mycall)
+HELP_VERBOSE = """\
+==============================================================================
+                          SIMPLE PACKET TERMINAL
+                         Comprehensive Command Guide
+==============================================================================
 
-    # Clear on program start and show banner/header
+CONNECTION COMMANDS:
+  /c CALL                    Connect to CALL (e.g., /c N0CALL)
+  /connect CALL              Same as /c
+  /c CALL via DIGI1,DIGI2    Connect through digipeaters
+  /d                         Disconnect from current station
+  /disconnect                Same as /d
+
+UNPROTO (UI) COMMANDS:
+  /unproto DEST MESSAGE      Send single UI frame to DEST
+  /unproto DEST via DIGI MESSAGE  Send UI frame through digipeaters
+  /unproto DEST              Enter persistent unproto mode to DEST
+  /unproto DEST via DIGI     Enter persistent mode through digipeaters
+  /unproto off               Exit persistent unproto mode
+  /upexit                    Same as /unproto off
+
+CONFIGURATION:
+  /echo on|off               Enable/disable local echo of sent text
+  /crlf on|off               Send CR+LF (on) or just CR (off) line endings
+  /retries N                 Set connection retry attempts (default: 3)
+  /color rx <name>           Set RX (payload) color; 'none' to disable
+  /color prompt <name>       Set prompt color; 'none' to disable
+  /debug                     Toggle debug output (shows frame details)
+
+UTILITY:
+  /clear                     Clear screen and show header
+  /cls                       Same as /clear
+  /status                    Show detailed connection and configuration status
+  /h                         Show basic help
+  /help                      Same as /h
+  /help -v                   Show this detailed help
+  /q                         Quit the program
+  /quit                      Same as /q
+  /exit                      Same as /q
+
+USAGE NOTES:
+  • When connected, regular text is sent as I-frames to the remote station
+  • Empty lines during BBS paging will continue to next page
+  • Type 'A' during BBS paging to abort/stop
+  • Slash commands starting with unknown options are forwarded to BBS when connected
+  • Commands are case-insensitive
+  • Use Ctrl+C to interrupt operations
+
+EXAMPLES:
+  /c KC1ABC                  Connect to KC1ABC
+  /c N0CALL via W1AW-1       Connect via digipeater
+  /unproto CQ Hello World    Send "Hello World" to CQ
+  /unproto APRS via WIDE1-1,WIDE2-1  Enter APRS mode via path
+  /echo on                   Enable local echo
+  /status                    Check current settings
+
+==============================================================================
+"""
+
+BANNER = """\
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Simple Packet Terminal                               │
+│                   Free and Open Source, Without Warranty                    │
+│                                 KC3SMW                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+"""
+
+def default_on_connected_ui(mycall: str, host: str, port: int):
+    """Called when we get a successful connection - clear screen and show connected banner"""
     clear_screen()
-    print_banner(mycall, host, port)
+    print(BANNER)
+    print(f"┌─ KISS Connection: {host}:{port}    ─ MYCALL: {mycall} ─ CONNECTED ─┐")
+    print("│                                                                     │")
+    print("└─────────────────────────────────────────────────────────────────────┘\n")
 
-    # --- simple session logging (toggle-able) ---
-    log_path = f"session-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
-    logf = open(log_path, "w", buffering=1)
-    logging_enabled = True  # default ON
+def run(mycall: str, target: Optional[str], host: str, port: int):
+    # Show startup banner immediately at the very beginning
+    print(BANNER)
+    print(f"KISS Connection: {host}:{port}  ─   MYCALL: {mycall}")
+    print("Type /help for commands, /help -v for detailed help")
+    print("───────────────────────────────────────────────────\n")
 
-    # readline history setup (TTY only)
-    if HAVE_READLINE and sys.stdin.isatty():
-        histfile = os.path.expanduser("~/.spt_history")
-        try:
-            readline.read_history_file(histfile)
-        except FileNotFoundError:
-            pass
-        atexit.register(lambda: readline.write_history_file(histfile))
+    link = KissLink(host, port, mycall)
 
     # --- header printer used at start & on UA & by /clear ---
     def print_header():
-        print(f"⟨KISS AX.25 Terminal⟩ MYCALL={mycall}  KISS={host}:{port}")
-        print(HELP_BRIEF)
+        print(BANNER)
+        print(f"┌─ KISS Connection: {host}:{port} ─ MYCALL: {mycall} ─┐")
+        print("│  Type /help for commands, /help -v for detailed help │")
+        print("└───────────────────────────────────────────────────────┘\n")
 
     def ui_clear_and_header():
         clear_screen()
         print_header()
-
-    # --- one-line status printer (reused) ---
-    def status_line() -> str:
-        echo_on = "on" if getattr(link, "local_echo", True) else "off"
-        crlf_on = "on" if getattr(link, "tx_newline", "\r") == "\r\n" else "off"
-        up      = "on" if link.unproto_mode else "off"
-        up_to   = link.unproto_dest or "(none)"
-        up_via  = ",".join(link.unproto_digis) if link.unproto_digis else "[]"
-        return (f"\n[STATUS] state={link.state} dest={link.dest or '(none)'} "
-                f"vs={link.vs} vr={link.vr} digis={link.digis or '[]'} "
-                f"echo={echo_on} crlf={crlf_on} retries={link.retries} "
-                f"unproto={up} to={up_to} via={up_via} "
-                f"log={'on' if logging_enabled else 'off'} file={log_path}\n\n")
 
     # --- dynamic prompt builder with color ---
     def prompt() -> str:
@@ -596,286 +752,306 @@ def run(mycall, target, host, port):
             core = f"[{mycall.upper()} @ {link.dest}] >> "
         else:
             core = f"[{mycall.upper()}] >> "
-        return colorize(core)
+        return colorize_prompt(core)
 
     # --- incoming lines: overwrite current input line, then redraw prompt ---
+    logfile = open(f"session-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log", "w", buffering=1)
+
     def emit(s: str):
-        if logging_enabled and logf:
-            try:
-                logf.write(s + "\n")
-            except Exception:
-                pass
+        # system/link/unproto notices
+        try:
+            logfile.write(s + "\n")
+        except Exception:
+            pass
         with link.ui_lock:
             if _supports_ansi():
-                #sys.stdout.write("\r\033[2K" + s + "\n")
-                sys.stdout.write("\r\033[2K" + "\033[33m" + s + "\033[0m\n")
+                sys.stdout.write("\r\033[2K" + s + "\n")
+                sys.stdout.write("\033[2K" + prompt())
+            else:
+                sys.stdout.write("\r" + s + "\n" + prompt())
+            sys.stdout.flush()
+
+    def emit_rx(s: str):
+        # payload lines (I-frame text and RX UI monitor)
+        try:
+            logfile.write(s + "\n")
+        except Exception:
+            pass
+        with link.ui_lock:
+            if _supports_ansi():
+                sys.stdout.write("\r\033[2K" + colorize_rx(s) + "\n")
                 sys.stdout.write("\033[2K" + prompt())
             else:
                 sys.stdout.write("\r" + s + "\n" + prompt())
             sys.stdout.flush()
 
     link.on_line = emit
-    link.on_connected_ui = ui_clear_and_header
-    link.connect()
-    print_header()
-    print(status_line())  # show current settings immediately
+    link.on_rx_line = emit_rx     # NEW: hook RX payloads to colored emitter
+    link.on_connected_ui = lambda: default_on_connected_ui(mycall, host, port)
+
+    # Connect to KISS after banner is shown
+    try:
+        link.connect()
+    except Exception as e:
+        print(f"[ERROR] Failed to connect to KISS: {e}")
+        return
+
+    # readline history (best-effort)
+    if sys.stdin.isatty():
+        try:
+            import readline  # type: ignore
+            histfile = os.path.expanduser("~/.spt_history")
+            try:
+                readline.read_history_file(histfile)
+            except FileNotFoundError:
+                pass
+            atexit.register(lambda: readline.write_history_file(histfile))
+        except Exception:
+            pass
+
+    # Optional tip if a target was provided on CLI
     if target:
         print(f"Tip: /c {target}")
 
-    try:
-        while True:
-            # print prompt and read a line; use input() so readline can hook in
+    while True:
+        try:
+            # display prompt and read
             sys.stdout.write(prompt()); sys.stdout.flush()
-            try:
-                line = input("")
-            except EOFError:
-                break
+            line = input("")
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            emit("^C"); break
 
-            # normalize line
-            line = line.rstrip("\n")
-            cmd  = line.strip()
-            low  = cmd.lower()
-            toks = low.split()
-            ftok = toks[0] if toks else ""
+        # normalize
+        line = line.rstrip("\n")
+        cmd  = line.strip()
+        low  = cmd.lower()
+        toks = low.split()
+        ftok = toks[0] if toks else ""
 
-            # add to readline history (if enabled) for arrow-key recall
-            if HAVE_READLINE and sys.stdin.isatty() and cmd:
-                try:
-                    readline.add_history(cmd)
-                except Exception:
-                    pass
+        # UNPROTO persistent mode: plain lines go as UI frames
+        if cmd and not cmd.startswith("/") and link.unproto_mode and link.unproto_dest:
+            link.send_unproto(link.unproto_dest, cmd, link.unproto_digis)
+            continue
 
-            # UNPROTO persistent mode: plain lines go as UI frames
-            if cmd and not cmd.startswith("/") and link.unproto_mode and link.unproto_dest:
-                link.send_unproto(link.unproto_dest, cmd, link.unproto_digis)
-                continue
+        # If we're handshaking (AWAIT_UA): queue any *plain* text until UA
+        if cmd and not cmd.startswith("/") and link.state != "CONNECTED":
+            link.queue_after_connect(cmd)
+            print(f"[QUEUED] Will send after link to {link.dest or '(pending)'} comes up.")
+            continue
 
-            # If we're handshaking (AWAIT_UA): queue any *plain* text until UA
-            if cmd and not cmd.startswith("/") and link.state != "CONNECTED":
-                link.queue_after_connect(cmd)
-                print(f"[QUEUED] Will send after link to {link.dest or '(pending)'} comes up.")
-                continue
-
-            # Empty line: pager continue
-            if not cmd:
-                if getattr(link, "more_prompt_pending", False):
-                    link.send_text("")
-                    link.more_prompt_pending = False
-                continue
-
-            # Pager abort
-            if getattr(link, "more_prompt_pending", False) and low == "a":
-                link.send_text("A")
+        # Empty line: pager continue or normal behavior
+        if not cmd:
+            if getattr(link, "more_prompt_pending", False):
+                dprint("PAGER: Sending CR to continue")
+                link.send_text("")  # Send just CR
                 link.more_prompt_pending = False
+            continue
+
+        # Pager abort - handle both 'a' and 'A'
+        if getattr(link, "more_prompt_pending", False) and low in ("a", "abort"):
+            dprint("PAGER: Sending abort")
+            link.send_text("A")
+            link.more_prompt_pending = False
+            continue
+
+        # quit / exit
+        if ftok in ("/q", "/quit", "/exit"):
+            link.disconnect()
+            break
+
+        # help
+        if ftok in ("/h", "/help"):
+            if len(toks) >= 2 and toks[1] == "-v":
+                print(HELP_VERBOSE)
+            else:
+                print(HELP)
+            continue
+
+        # disconnect
+        if ftok in ("/d", "/disconnect"):
+            link.disconnect()
+            # redraw prompt immediately
+            sys.stdout.write("\r\033[2K" + prompt()); sys.stdout.flush()
+            continue
+
+        # connect
+        if ftok in ("/c", "/connect"):
+            parts = cmd.split()
+            dest = parts[1] if len(parts) > 1 else (target or "")
+            digis: List[str] = []
+            # support "via" 2 or 3 words after dest
+            if len(parts) >= 4 and parts[2].lower() == "via":
+                digis = [d.strip().upper() for d in parts[3].split(",") if d.strip()]
+            if not dest:
+                print("Usage: /connect <DEST> [via DIGI1,DIGI2]")
+                continue
+            link.digis = digis
+            link.call(dest)
+            continue
+
+        # clear screen
+        if ftok in ("/clear", "/cls"):
+            ui_clear_and_header()
+            continue
+
+        # status
+        if ftok == "/status":
+            via = f" via {','.join(link.digis)}" if link.digis else ""
+            unproto_via = f" via {','.join(link.unproto_digis)}" if link.unproto_digis else ""
+            print(f"[STATUS] state={link.state} dest={link.dest or '(none)'} vs={link.vs} vr={link.vr}")
+            print(f"         digis={via or '[]'} echo={'on' if link.local_echo else 'off'} crlf={'on' if link.tx_newline=='\r\n' else 'off'}")
+            print(f"         retries={link.retries} unproto={'on' if link.unproto_mode else 'off'} to={link.unproto_dest or '(none)'}{unproto_via}")
+            print(f"         pager_pending={link.more_prompt_pending}")
+            continue
+
+        # echo
+        if ftok == "/echo" and len(toks) >= 2:
+            link.local_echo = toks[1] == "on"
+            print(f"[ECHO] {'on' if link.local_echo else 'off'}")
+            continue
+
+        # crlf
+        if ftok == "/crlf" and len(toks) >= 2:
+            link.tx_newline = "\r\n" if toks[1] == "on" else "\r"
+            print(f"[CRLF] {'on' if link.tx_newline=='\r\n' else 'off (CR only)'}")
+            continue
+
+        # retries
+        if ftok == "/retries" and len(toks) >= 2:
+            try:
+                link.retries = max(1, int(toks[1]))
+                print(f"[RETRIES] {link.retries}")
+            except ValueError:
+                print("[RETRIES] must be an integer >= 1")
+            continue
+
+        # debug
+        if ftok == "/debug":
+            global DEBUG
+            DEBUG = not DEBUG
+            print(f"[DEBUG] {'on' if DEBUG else 'off'}")
+            continue
+
+        # color
+        if ftok == "/color":
+            COLORS = {
+                "black":"\033[30m","red":"\033[31m","green":"\033[32m","yellow":"\033[33m",
+                "blue":"\033[34m","magenta":"\033[35m","cyan":"\033[36m","white":"\033[37m",
+                "brightblack":"\033[90m","brightred":"\033[91m","brightgreen":"\033[92m",
+                "brightyellow":"\033[93m","brightblue":"\033[94m","brightmagenta":"\033[95m",
+                "brightcyan":"\033[96m","brightwhite":"\033[97m",
+                "none":""  # disables coloring for that target
+            }
+            if len(toks) >= 3 and toks[1] in ("rx","prompt"):
+                target_name, color_name = toks[1], toks[2]
+                if color_name in COLORS:
+                    global RX_COLOR, PROMPT_COLOR
+                    if target_name == "rx":
+                        RX_COLOR = COLORS[color_name]
+                    else:
+                        PROMPT_COLOR = COLORS[color_name]
+                    print(f"[COLOR] {target_name} set to {color_name}")
+                else:
+                    print("[COLOR] Unknown color. Try: green, yellow, magenta, brightcyan, none …")
+            else:
+                print("Usage: /color rx <name> | /color prompt <name>")
+            continue
+
+        # UNPROTO with improved digipeater support
+        if ftok == "/unproto":
+            # forms:
+            #   /unproto DEST [via DIGI1,DIGI2] message...
+            #   /unproto DEST [via DIGI1,DIGI2]
+            #   /unproto off|stop|end|exit
+            if len(toks) >= 2 and toks[1] in ("off","stop","end","exit"):
+                link.unproto_mode = False
+                link.unproto_dest = None
+                link.unproto_digis = []
+                print("[UNPROTO] off")
                 continue
 
-            # quit / exit
-            if ftok in ("/q", "/quit", "/exit"):
-                link.disconnect()
-                break
-
-            # disconnect
-            if ftok in ("/d", "/disconnect"):
-                link.disconnect()
-                sys.stdout.write("\r\033[2K" + prompt()); sys.stdout.flush()
-                continue
-
-            # connect
-            if ftok in ("/c", "/connect"):
-                parts = cmd.split()
-                dest = parts[1] if len(parts) > 1 else (target or "")
+            parts = cmd.split()
+            if len(parts) >= 2:
+                dest = parts[1].upper()
                 digis = []
+                msg_start = 2
                 if len(parts) >= 4 and parts[2].lower() == "via":
+                    # Parse digipeater list
                     digis = [d.strip().upper() for d in parts[3].split(",") if d.strip()]
-                if not dest:
-                    print("Usage: /connect <DEST> [via DIGI1,DIGI2]")
-                    continue
-                link.digis = digis
-                link.call(dest)
-                continue
-
-            # retries
-            if ftok == "/retries":
-                if len(toks) == 2 and toks[1].isdigit():
-                    link.retries = max(1, int(toks[1]))  # must be >=1
-                    print(f"[RETRIES] Set to {link.retries}")
-                else:
-                    print(f"[RETRIES] Currently {link.retries}. Usage: /retries N")
-                continue
-
-            # clear screen
-            if ftok in ("/clear", "/cls"):
-                ui_clear_and_header()
-                continue
-
-            # unproto (enter/exit or one-shot)
-            if ftok == "/unproto":
-                ups = cmd.split()
-                if len(ups) >= 2 and ups[1].lower() in ("off", "stop", "end", "exit"):
-                    link.unproto_mode = False
-                    link.unproto_dest = None
-                    link.unproto_digis = []
-                    print("[UNPROTO] Persistent mode OFF.")
-                    continue
-
-                if len(ups) < 2:
-                    print("Usage: /unproto DEST [via DIGI1,DIGI2] [message...]")
-                    print("       /unproto off|stop|end|exit")
-                    continue
-
-                dest = ups[1].upper()
-                digis = []
-                msg = ""
-
-                via_idx = None
-                for i, t in enumerate(ups):
-                    if t.lower() == "via":
-                        via_idx = i; break
-
-                if via_idx is not None:
-                    if via_idx + 1 < len(ups):
-                        digis = [d.strip().upper() for d in ups[via_idx+1].split(",") if d.strip()]
-                    if via_idx + 2 < len(ups):
-                        msg = " ".join(ups[via_idx+2:])
-                else:
-                    if len(ups) >= 3:
-                        msg = " ".join(ups[2:])
-
-                if msg:
+                    msg_start = 4
+                if msg_start < len(parts):
+                    # one-shot with message
+                    msg = " ".join(parts[msg_start:])
                     link.send_unproto(dest, msg, digis)
                 else:
+                    # enter persistent mode
                     link.unproto_mode = True
                     link.unproto_dest = dest
                     link.unproto_digis = digis
                     via = f" via {','.join(digis)}" if digis else ""
-                    print(f"[UNPROTO] Persistent mode ON -> {dest}{via}. Type /upexit to exit.")
+                    print(f"[UNPROTO] persistent: {link.unproto_dest}{via}")
                 continue
 
-            # Unproto exit aliases
-            if low in ("/upexit", "/upoff", "/upstop"):
-                if link.unproto_mode:
-                    link.unproto_mode = False
-                    link.unproto_dest = None
-                    link.unproto_digis = []
-                    print("[UNPROTO] Persistent mode OFF.")
-                else:
-                    print("[UNPROTO] Not in unproto mode.")
-                continue
+            print("Usage: /unproto DEST [via DIGI1,DIGI2] [message...]  |  /unproto off")
+            continue
 
-            # status
-            if ftok == "/status":
-                print(status_line())
-                continue
+        # Exit unproto mode
+        if ftok == "/upexit":
+            if link.unproto_mode:
+                link.unproto_mode = False
+                link.unproto_dest = None
+                link.unproto_digis = []
+                print("[UNPROTO] exited persistent mode")
+            else:
+                print("[UNPROTO] not in persistent mode")
+            continue
 
-            # debug
-            if ftok == "/debug":
-                global DEBUG
-                DEBUG = not DEBUG
-                print(f"[DEBUG] {'ON' if DEBUG else 'OFF'}")
-                continue
+        # unknown slash-commands: forward when connected (BBS-friendly)
+        if cmd.startswith("/") and link.state == "CONNECTED":
+            link.send_text(cmd)
+            continue
 
-            # echo
-            if ftok == "/echo":
-                if len(toks) == 2 and toks[1] in ("on", "off"):
-                    link.local_echo = (toks[1] == "on")
-                    print(f"[ECHO] {'ON' if link.local_echo else 'OFF'}")
-                else:
-                    print("Usage: /echo on|off")
-                continue
+        # plain text in connected mode
+        if link.state == "CONNECTED":
+            link.send_text(cmd)
+            continue
 
-            # crlf
-            if ftok == "/crlf":
-                if len(toks) == 2 and toks[1] in ("on", "off"):
-                    link.tx_newline = "\r\n" if toks[1] == "on" else "\r"
-                    print(f"[CRLF] {'ON (\\r\\n)' if link.tx_newline=='\\r\\n' else 'OFF (\\r)'}")
-                else:
-                    print("Usage: /crlf on|off")
-                continue
+        print("Unknown command. /h for help.")
 
-            # log on|off|show
-            if ftok == "/log":
-                if len(toks) == 1:
-                    print(f"[LOG] {'ON' if logging_enabled else 'OFF'} (file: {log_path})")
-                elif len(toks) == 2 and toks[1] in ("on", "off"):
-                    logging_enabled = (toks[1] == "on")
-                    print(f"[LOG] {'ON' if logging_enabled else 'OFF'} (file: {log_path})")
-                else:
-                    print("Usage: /log on|off  (or just /log to show)")
-                continue
+def main():
+    # Clear screen immediately when program starts - before any other output
+    clear_screen()
 
-            # help
-            if ftok in ("/h", "/help"):
-                if "-v" in toks or "verbose" in toks:
-                    print(HELP_VERBOSE)
-                else:
-                    print(HELP_BRIEF)
-                continue
+    # CLI forms:
+    #   SPT_0_9a.py MYCALL
+    #   SPT_0_9a.py MYCALL TARGET
+    #   SPT_0_9a.py MYCALL TARGET HOST PORT
+    #   SPT_0_9a.py MYCALL TARGET HOST:PORT
+    argv = sys.argv[:]
+    if len(argv) < 2:
+        print("Usage: SPT_0_9a.py MYCALL [TARGET] [HOST] [PORT]  |  SPT_0_9a.py MYCALL TARGET HOST:PORT")
+        sys.exit(1)
+    mycall = argv[1].upper()
+    target = None
+    host, port = KISS_HOST_DEFAULT, KISS_PORT_DEFAULT
 
-            # Unknown slash command
-            if cmd.startswith("/"):
-                if link.state == "CONNECTED" and not link.unproto_mode:
-                    # Forward to peer so BBS /ex etc. work
-                    link.send_text(cmd)
-                else:
-                    print("command not found use /h for list of commands")
-                continue
+    if len(argv) >= 3:
+        target = argv[2]
+    if len(argv) >= 4:
+        if ":" in argv[3]:
+            host, p = argv[3].split(":", 1)
+            port = int(p)
+        else:
+            host = argv[3]
+            if len(argv) >= 5:
+                port = int(argv[4])
 
-            # Otherwise, send user text on the connected link
-            link.send_text(line)
-            if logging_enabled and logf:
-                try:
-                    logf.write("> " + line + "\n")
-                except Exception:
-                    pass
-
-    except KeyboardInterrupt:
-        pass
+    try:
+        run(mycall, target, host, port)
     finally:
-        try:
-            if logf: logf.close()
-        except Exception: pass
-        link.close()
-        print("\n⟨KISS AX.25 Terminal⟩ bye.")
-
-# ---------- CLI parsing ----------
-def _looks_like_host(s: str) -> bool:
-    return s == "localhost" or "." in s or ":" in s
+        pass
 
 if __name__ == "__main__":
-    # Accepted forms:
-    #   SPT.py MYCALL
-    #   SPT.py MYCALL TARGET
-    #   SPT.py MYCALL TARGET HOST
-    #   SPT.py MYCALL TARGET HOST PORT
-    #   SPT.py MYCALL TARGET 0 HOST PORT        # legacy RF port ignored
-    #   SPT.py MYCALL TARGET HOST:PORT
-    args = sys.argv[1:]
-    if len(args) < 1:
-        print(f"Usage: {sys.argv[0]} MYCALL [TARGET] [HOST] [PORT]")
-        print(f"   or: {sys.argv[0]} MYCALL TARGET HOST:PORT")
-        sys.exit(1)
-
-    mycall = args[0]
-    target = None
-    host = KISS_HOST_DEFAULT
-    port = KISS_PORT_DEFAULT
-
-    i = 1
-    if i < len(args) and not _looks_like_host(args[i]) and not args[i].isdigit():
-        target = args[i]; i += 1
-    if i < len(args) and args[i].isdigit():
-        i += 1  # ignore legacy RF arg
-    if i < len(args):
-        hp = args[i]; i += 1
-        if ":" in hp:
-            h, p = hp.split(":", 1)
-            if h: host = h
-            try: port = int(p)
-            except ValueError: pass
-        elif _looks_like_host(hp):
-            host = hp
-    if i < len(args):
-        try: port = int(args[i])
-        except ValueError: pass
-
-    run(mycall, target, host, port)
+    main()
