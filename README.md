@@ -1,224 +1,132 @@
-# SPT — Simple Packet Terminal
+# Simple Packet Terminal (SPT)
 
-SPT is a tiny, cross-platform **KISS + AX.25** terminal for amateur packet radio.  
-It speaks to **Direwolf** over TCP KISS, gives you a clean, colorized prompt, handles BBS “more” prompts gracefully, and supports both **connected** AX.25 and **UNPROTO (UI)** frames.
+**SPT** is a tiny, cross-platform **KISS + AX.25** terminal for amateur packet radio.
+It talks to **Direwolf** (or any KISS-TCP TNC), gives you a clean color prompt, handles
+BBS **pager** prompts gracefully, and supports both **connected** AX.25 and **UNPROTO (UI)** frames.
 
-Created by **Chengmania (KC3SMW)**. Open source and hackable.
-
----
-
-## Why SPT?
-
-- **Dead simple:** one file, no external Python packages.
-- **Fast start:** point it at Direwolf’s KISS TCP port and go.
-- **Friendly TTY UX:** light-blue prompt, clean redraws, and pager awareness.
-- **Real work flows:** connect to nodes/BBSs or chat unconnected via UNPROTO.
-- **Portable:** Linux, macOS, Windows (PowerShell/Windows Terminal).
+Created by **Chengmania (KC3SMW)**. Free & open source, without warranty.
 
 ---
 
-## Features
+## Highlights
 
-- KISS TCP client for Direwolf
-- AX.25 LAPB (mod-8): SABM/UA/DISC, I-frames, RR (keepalive)
-- Pager awareness for BBS prompts like:  
-- Colorized prompt: `[MYCALL @ PEER] >>` (TTY only)
-- Logs each session to `session-YYYYMMDD-HHMMSS.log`
-- **UNPROTO (UI) support:**
-  - One-shot `/unproto DEST [via DIGI1,DIGI2] message…`
-  - Persistent UNPROTO mode until `/ex`
-- Screen clear on start and on connect; quick `/clear` or `/cls`
-- Helpful command help (brief + verbose)
+- ✅ **Direwolf KISS-TCP** compatible (default `127.0.0.1:8001`)
+- ✅ **Connected mode** (SABME/SABM handshake, RR keepalives, DISC/UA handling)
+- ✅ **UNPROTO (UI) frames** — one-shot or persistent mode, with **digipeater paths**
+- ✅ **Pager detection** — smart regex + rolling buffer; `Enter` continues, `A` aborts
+- ✅ **Colorized UI** — distinct **prompt color** and **RX text color** (new in v0.9a)
+- ✅ **/color** command — change colors at runtime (e.g., `/color rx brightyellow`)
+- ✅ **Clear screens & banner** on start and on connect
+- ✅ **Status, history, logs** — `/status`, readline history, per-session log files
+- ✅ **Retries control** — `/retries N` for handshake attempts
+- ✅ **BBS-friendly** — unknown slash commands are forwarded when connected
 
 ---
 
 ## Requirements
 
-- **Python**: 3.8+ (standard library only; no `pip install` needed)
-- **Direwolf** (with KISS TCP enabled)
-  - Linux/macOS: use your package manager (`brew install direwolf` on macOS)
-  - Windows: run Direwolf and allow it through the firewall on first use
-
-> **Note (Windows-only):** If you use legacy `cmd.exe` and ANSI colors don’t display, you can optionally `pip install colorama` and enable it in the script. In Windows Terminal/PowerShell, no changes are needed.
+- Python **3.8+**
+- A KISS-TCP TNC (e.g., **Direwolf**). Default: `127.0.0.1:8001`
+- A terminal that supports ANSI colors (optional but nice)
 
 ---
 
-## Configure Direwolf
+# Quick Start
 
-Make sure your `direwolf.conf` exposes a TCP KISS port, e.g.:
 
-```
-# Example
-KISSPORT 8001
-```
+### Clone
+`git clone https://github.com/chengmania/SimplePacketTerminal.git
+cd SimplePacketTerminal`
 
-Start Direwolf, confirm it prints something like:
+### Run (basic)
+`python3 SPT_0_9a.py KC3SMW`
 
-```
-Ready to accept KISS TCP client application 0 on port 8001 ...
-```
+### Run and show a tip to connect to a target call
+`python3 SPT_0_9a.py KC3SMW KC3SMW-7`
 
----
+### Custom KISS host/port
+`python3 SPT_0_9a.py KC3SMW KC3SMW-7 127.0.0.1 8001`
+### or:
+`python3 SPT_0_9a.py KC3SMW KC3SMW-7 127.0.0.1:8001`
 
-## Install
 
-Just copy **SPT.py** into it's own folder and run it.  
-No Python dependencies required.
+### Common Commands
+`
+/c | /connect CALL [via DIGI1,DIGI2]   Connect (AX.25)
+/d | /disconnect                       Disconnect
+/unproto DEST [via DIGI1,DIGI2] [msg]  UI frame; no msg -> persistent mode
+/upexit                                 Exit persistent unproto mode
+/echo on|off                            Local echo
+/crlf on|off                            Send CRLF instead of CR
+/retries N                              Set connect retries (default 3)
+/debug                                  Toggle debug logging
+/clear | /cls                           Clear screen
+/status                                 Show link status
+/color rx <name>|prompt <name>          Set RX/prompt color (e.g., brightyellow)
+/h | /help [-v]                         Show help (use -v for verbose)
+/q | /quit | /exit                      Quit`
 
----
+### Color Names (for /color)
 
-## Usage
+`black, red, green, yellow, blue, magenta, cyan, white, brightblack, brightred, brightgreen, brightyellow, brightblue, brightmagenta, brightcyan, brightwhite, none`
 
-```
-python3 SPT.py MYCALL [TARGET] [HOST] [PORT]
-python3 SPT.py MYCALL TARGET HOST:PORT
-```
+Examples:
+`/color rx brightyellow
+/color prompt magenta
+/color rx none`
 
-**Arguments (all optional after `MYCALL`):**
-- `TARGET` — station to auto-connect on startup (e.g., `KC3SMW-7`)
-- `HOST` & `PORT` — Direwolf KISS TCP (defaults: `127.0.0.1:8001`)
-- Legacy numeric RF port args are ignored for convenience.
+Default colors (v0.9a):
+Prompt: bright cyan (\033[96m)
+RX text: bright green (\033[92m)
 
-**Examples**
-```bash
-# Connect to a local Direwolf (127.0.0.1:8001) and just idle
-python3 SPT.py KC3SMW-0
 
-# Same, but auto connect to a node
-python3 SPT.py KC3SMW-0 KC3SMW-7
+Connect (no digis)
+`/connect KC3SMW-7`
 
-# Explicit host/port
-python3 SPT.py KC3SMW-0 KC3SMW-7 127.0.0.1 8001
+Connect via digipeaters
+`/connect KC3SMW-7 via WIDE1-1,WIDE2-1`
 
-# Host:Port shorthand
-python3 SPT.py KC3SMW-0 KC3SMW-7 127.0.0.1:8001
-```
 
----
+One-shot UNPROTO
+`/unproto CQ Hello from SPT`
 
-## Command Reference
+Persistent UNPROTO (type to send UI frames every line)
+`/unproto CQ
+... your lines are sent as UI frames ...
+/upexit`
 
-**Brief:**  
-`Commands: /(c)onnect CALL [via DIGI1,DIGI2] | /(d)isconnect | /(q)uit | /(h)elp | /status | /debug | /echo on|off | /crlf on|off | /clear | /unproto DEST [via DIGI1,DIGI2] [message…] | /ex`
 
-**Details (concise):**
-
-- `/(c)onnect CALL [via DIGI1,DIGI2]`  
-  Start a connected AX.25 session to `CALL`. Optional digis are comma-separated.
-
-- `/(d)isconnect`  
-  Send DISC and immediately return to idle prompt.
-
-- `/(q)uit`, `/quit`, `/exit`  
-  Exit SPT (sends DISC first if connected).
-
-- `/(h)elp`  
-  Show the brief command list.  
-  `/help -v` shows a longer explanation.
-
-- `/status`  
-  Print link state, peer, VR/VS, digi path, echo/crlf, and UNPROTO mode.
-
-- `/debug`  
-  Toggle raw frame debug logging in the console.
-
-- `/echo on|off`  
-  Local echo of what you transmit.
-
-- `/crlf on|off`  
-  Choose CRLF (`on`) or CR (`off`, default) for transmitted lines.
-
-- `/clear` or `/cls`  
-  Clear screen and reprint the brief command list.
-
-- `/unproto DEST [via DIGI1,DIGI2] message…`  
-  Send a one-shot **UI** frame (PID F0).  
-  Example: `/unproto CQ via WIDE1-1 Hello from SPT`
-
-- `/unproto DEST [via DIGI1,DIGI2]` (no message)  
-  Enter **persistent UNPROTO** mode to `DEST` (and digis).  
-  Every line that **doesn’t** start with `/` is sent as a UI frame.  
-  Use `/ex` to exit persistent UNPROTO mode.
-
-- `/ex`  
-  Exit persistent UNPROTO mode.
-
-**Unknown slash commands** print: `no ***`
-
----
-
-## Pager / “More” Prompts
-
-When a BBS shows something like `"<A>bort, <CR> Continue..>"`:
-
-- Press **Enter** to continue (SPT sends a bare CR or CRLF based on your setting).
-- Type `A` (uppercase or lowercase) to abort that page.
-
-SPT detects these lines and won’t spam prompts between screenfuls.
-
----
-
-## Example Session
-
-```
-$ python3 SPT.py KC3SMW-0 KC3SMW-7
-[KISS] Connected to 127.0.0.1:8001
-Commands: /(c)onnect CALL [via DIGI1,DIGI2] | /(d)isconnect | /(q)uit | /(h)elp | /status | /debug | /echo on|off | /crlf on|off | /clear | /unproto ... | /ex
-[KC3SMW-0] >> /c KC3SMW-7
-[LINK] Calling KC3SMW-7 …
-[LINK] CONNECTED to KC3SMW-7
-Welcome to the chengmanian Node...
-[KC3SMW-0 @ KC3SMW-7] >> bbs
-SMW:KC3SMW-7} Connected to BBS
-...
-[KC3SMW-0 @ KC3SMW-7] >> bye
-[LINK] Peer requested DISC.
-[KC3SMW-0] >>
-```
-
----
 
 ## Tips
 
-- Many nodes expect **CR** only (`/crlf off`), which is SPT’s default.
-- Use `/status` if you’re unsure whether you’re connected or in UNPROTO mode.
-- Want quiet TX lines? Keep `/echo off` (default).
-- You can enter UNPROTO mode to `CQ` or a friend’s call and chat without connecting.
+Queued input during handshake: If you start typing before the link is up,
+SPT queues your plain text and flushes it after UA/connect.
+CR vs CRLF: Some nodes want \r\n. Use /crlf on.
+History file: ~/.spt_history (if your Python has readline).
+Session logs: session-YYYYMMDD-HHMMSS.log in the working directory.
 
----
 
-## Troubleshooting
 
-- **Direwolf not reachable:** confirm `KISSPORT` and host/port in SPT match Direwolf’s log line.
-- **No audio/TX/RX:** check audio device levels in Direwolf; most stations should peak ~50.
-- **Colors look wrong on Windows:** prefer Windows Terminal/PowerShell. Legacy `cmd.exe` may need `colorama`.
-- **BBS paging locks input:** Hitting **Enter** or `A` should advance; if you typed a command mid-page, wait for the next prompt.
+### Troubleshooting
 
----
++No connect / UA: Try increasing /retries 5 and reattempt. Make sure Direwolf is listening on KISS TCP port 8001.
 
-## Roadmap / Ideas
++Colors look off: Your terminal theme may remap ANSI colors. Try /color rx brightyellow or /color rx none.
 
-- Config file for defaults (host/port, CRLF, echo)
-- AX.25 extended sequence support (mod-128)
-- Optional timestamps and coloring for RX/TX lines
-- Auto-reconnect / retry backoff
++Pager stuck: Tap Enter to advance; A to abort. If your BBS uses unusual prompts, send me a sample so we can add patterns.
 
----
 
-## Contributing
 
-Issues and PRs welcome! Keep the code single-file and dependency-free where possible.
+### Changelog
+v0.9a
 
----
+*NEW: RX text coloring (separate from prompt)
+*NEW: /color rx|prompt <name> to change colors at runtime
+*Improved: Pager detection (regex + rolling buffer) and state handling
+*Improved: Keepalives pause while pager prompts are pending
+*UI: Clear startup and connected banners; better status readout
+*UNPROTO: Cleaner digipeater handling for both one-shot and persistent modes
+*Link: SABME→SABM fallback, DM/FRMR handling, retry control via /retries
 
-## License
-
-Choose a license that fits your goals (MIT is a good default).  
-*(Replace this section with your chosen license file.)*
-
----
-
-## Acknowledgements
-
-- **Direwolf** by John WB2OSZ — the backbone TNC for this project.  
-- Everyone running packet nodes and BBSs that make testing and real use possible. 73!
+v0.9
+First polished 0.9 with pager fixes, better help, improved UI, connect/disconnect handling
