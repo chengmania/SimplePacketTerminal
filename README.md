@@ -53,18 +53,31 @@ cd SimplePacketTerminal`
 ### Common Commands
 `
 /c | /connect CALL [via DIGI1,DIGI2]   Connect (AX.25)
+
 /d | /disconnect                       Disconnect
+
 /unproto DEST [via DIGI1,DIGI2] [msg]  UI frame; no msg -> persistent mode
+
 /upexit                                 Exit persistent unproto mode
+
 /echo on|off                            Local echo
+
 /crlf on|off                            Send CRLF instead of CR
+
 /retries N                              Set connect retries (default 3)
+
 /debug                                  Toggle debug logging
+
 /clear | /cls                           Clear screen
+
 /status                                 Show link status
+
 /color rx <name>|prompt <name>          Set RX/prompt color (e.g., brightyellow)
+
 /h | /help [-v]                         Show help (use -v for verbose)
+
 /q | /quit | /exit                      Quit`
+
 
 ### Color Names (for /color)
 
