@@ -51,7 +51,7 @@ cd SimplePacketTerminal`
 
 
 ### Common Commands
-`
+```
 /c | /connect CALL [via DIGI1,DIGI2]   Connect (AX.25)
 
 /d | /disconnect                       Disconnect
@@ -77,7 +77,7 @@ cd SimplePacketTerminal`
 /h | /help [-v]                         Show help (use -v for verbose)
 
 /q | /quit | /exit                      Quit`
-
+```
 
 ### Color Names (for /color)
 
