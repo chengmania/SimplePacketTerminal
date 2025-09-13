@@ -53,40 +53,30 @@ cd SimplePacketTerminal`
 ### Common Commands
 ```
 /c | /connect CALL [via DIGI1,DIGI2]   Connect (AX.25)
-
 /d | /disconnect                       Disconnect
-
 /unproto DEST [via DIGI1,DIGI2] [msg]  UI frame; no msg -> persistent mode
-
 /upexit                                 Exit persistent unproto mode
-
 /echo on|off                            Local echo
-
 /crlf on|off                            Send CRLF instead of CR
-
 /retries N                              Set connect retries (default 3)
-
 /debug                                  Toggle debug logging
-
 /clear | /cls                           Clear screen
-
 /status                                 Show link status
-
 /color rx <name>|prompt <name>          Set RX/prompt color (e.g., brightyellow)
-
 /h | /help [-v]                         Show help (use -v for verbose)
-
 /q | /quit | /exit                      Quit`
 ```
 
 ### Color Names (for /color)
 
-`black, red, green, yellow, blue, magenta, cyan, white, brightblack, brightred, brightgreen, brightyellow, brightblue, brightmagenta, brightcyan, brightwhite, none`
+```black, red, green, yellow, blue, magenta, cyan, white, brightblack, brightred, brightgreen, brightyellow, brightblue, brightmagenta, brightcyan, brightwhite, none```
 
 Examples:
-`/color rx brightyellow
+```
+/color rx brightyellow
 /color prompt magenta
-/color rx none`
+/color rx none
+```
 
 Default colors (v0.9a):
 Prompt: bright cyan (\033[96m)
@@ -94,52 +84,57 @@ RX text: bright green (\033[92m)
 
 
 Connect (no digis)
-`/connect KC3SMW-7`
+```
+/connect KC3SMW-7
+```
 
 Connect via digipeaters
-`/connect KC3SMW-7 via WIDE1-1,WIDE2-1`
-
+```
+/connect KC3SMW-7 via WIDE1-1,WIDE2-1
+```
 
 One-shot UNPROTO
-`/unproto CQ Hello from SPT`
+```
+/unproto CQ Hello from SPT
+```
 
 Persistent UNPROTO (type to send UI frames every line)
-`/unproto CQ
+```
+/unproto CQ
 ... your lines are sent as UI frames ...
-/upexit`
-
-
+/upexit
+```
 
 ## Tips
 
-Queued input during handshake: If you start typing before the link is up,
-SPT queues your plain text and flushes it after UA/connect.
-CR vs CRLF: Some nodes want \r\n. Use /crlf on.
-History file: ~/.spt_history (if your Python has readline).
-Session logs: session-YYYYMMDD-HHMMSS.log in the working directory.
+* Queued input during handshake: If you start typing before the link is up,
+* SPT queues your plain text and flushes it after UA/connect.
+* CR vs CRLF: Some nodes want \r\n. Use /crlf on.
+* History file: ~/.spt_history (if your Python has readline).
+* Session logs: session-YYYYMMDD-HHMMSS.log in the working directory.
 
 
 
 ### Troubleshooting
 
-+No connect / UA: Try increasing /retries 5 and reattempt. Make sure Direwolf is listening on KISS TCP port 8001.
+* No connect / UA: Try increasing /retries 5 and reattempt. Make sure Direwolf is listening on KISS TCP port 8001.
 
-+Colors look off: Your terminal theme may remap ANSI colors. Try /color rx brightyellow or /color rx none.
+* Colors look off: Your terminal theme may remap ANSI colors. Try /color rx brightyellow or /color rx none.
 
-+Pager stuck: Tap Enter to advance; A to abort. If your BBS uses unusual prompts, send me a sample so we can add patterns.
+* Pager stuck: Tap Enter to advance; A to abort. If your BBS uses unusual prompts, send me a sample so we can add patterns.
 
 
 
 ### Changelog
 v0.9a
 
-*NEW: RX text coloring (separate from prompt)
-*NEW: /color rx|prompt <name> to change colors at runtime
-*Improved: Pager detection (regex + rolling buffer) and state handling
-*Improved: Keepalives pause while pager prompts are pending
-*UI: Clear startup and connected banners; better status readout
-*UNPROTO: Cleaner digipeater handling for both one-shot and persistent modes
-*Link: SABME→SABM fallback, DM/FRMR handling, retry control via /retries
+* NEW: RX text coloring (separate from prompt)
+* NEW: /color rx|prompt <name> to change colors at runtime
+* Improved: Pager detection (regex + rolling buffer) and state handling
+* Improved: Keepalives pause while pager prompts are pending
+* UI: Clear startup and connected banners; better status readout
+* UNPROTO: Cleaner digipeater handling for both one-shot and persistent modes
+* Link: SABME→SABM fallback, DM/FRMR handling, retry control via /retries
 
 v0.9
 First polished 0.9 with pager fixes, better help, improved UI, connect/disconnect handling
